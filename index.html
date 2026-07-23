@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Play with Bubbles! | Bubbles</title>
+    <title>Play with Pxxps! | Pxxps</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
     <style>
         * { box-sizing: border-box; }
@@ -526,11 +526,11 @@
             });
         } catch (e) {
             if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
-                throw new Error('Camera access was denied.\nClick the camera icon next to the browser address bar and choose Allow.\n\nYou can open the app directly at https://icommuse.github.io/bubbles.');
+                throw new Error('Camera access was denied.\nClick the camera icon next to the browser address bar and choose Allow.\n\nYou can open the app directly at https://elicainc.github.io/ppp.');
             } else if (e.name === 'NotFoundError') {
                 throw new Error('No camera was found. Please make sure a camera is connected.');
             } else if (e instanceof TypeError) {
-                throw new Error('Camera initialization error (TypeError).\nPlease open the app at https://icommuse.github.io/bubbles.');
+                throw new Error('Camera initialization error (TypeError).\nPlease open the app at https://elicainc.github.io/ppp.');
             } else {
                 throw new Error('Camera error: ' + e.name + ' - ' + e.message);
             }
@@ -1029,7 +1029,7 @@
         if (location.protocol === 'file:') {
             loading.innerHTML =
                 '⚠️ Opened with file://.<br>If the camera does not work, you can open the app directly here.<br><br>' +
-                '<a href="https://icommuse.github.io/bubbles" style="color:#7af">https://icommuse.github.io/bubbles</a><br><br>' +
+                '<a href="https://elicainc.github.io/ppp" style="color:#7af">https://elicainc.github.io/ppp</a><br><br>' +
                 'Loading...';
         }
 
