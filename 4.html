@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Poop Hat</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            overflow: hidden;
+            color: #fff;
+            font-family: sans-serif;
+        }
+        /* ビデオ要素は非表示にし、Canvasに描画します */
+        video { display: none; }
+        /* 鏡のように表示するため反転させます（2D/3Dの両キャンバスに適用） */
+        canvas {
+            transform: scaleX(-1);
+            position: fixed;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+        }
+        #loading {
+            position: absolute;
+            font-size: 24px;
+            font-weight: bold;
+            z-index: 10;
+            text-align: center;
+            padding: 20px;
+        }
+        #loading.error {
+            color: #ff6b6b;
+            font-size: 18px;
+            max-width: 80vw;
+            line-height: 1.6;
+            white-space: pre-line;
+        }
+        #hint {
+            display: none;
+            position: absolute;
+            bottom: 70px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 28px;
+            font-weight: bold;
+            color: #fff;
+            text-shadow: 0 0 12px rgba(255,180,255,0.9), 0 2px 8px rgba(0,0,0,0.8);
+            letter-spacing: 0.05em;
+            z-index: 10;
+            white-space: nowrap;
+            animation: hintPulse 2s ease-in-out infinite;
+        }
+        #hint.fadeout { animation: hintFade 1.5s ease forwards; }
+        @keyframes hintPulse {
+            0%, 100% { opacity: 1;   transform: translateX(-50%) scale(1); }
+            50%       { opacity: 0.6; transform: translateX(-50%) scale(1.05); }
+        }
+        @keyframes hintFade { from { opacity: 1; } to { opacity: 0; } }
+    </style>
+
+    <!-- TensorFlow.js と関連ライブラリ -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.22.0/dist/tf-core.min.js"
+            integrity="sha384-ZVckeGw84RpbmPMzx1s9LFUqIaeIsG46rmlH/HynDuJikkmGLnTDnEmT0CrKI6Yi"
+            crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.22.0/dist/tf-backend-webgl.min.js"
+            integrity="sha384-PAbE0QuTSZkDuS/hX4MEx1MZ0Nwd+mkb2Znz35ZqGDjb36klpR8/mCpykhdd7uHW"
+            crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js"
+            integrity="sha384-nKiz5QrpRlMQLw5nrZcprT7N9vmmAcIgV8TuGuep4x91V4JIPsXa+D44Wxj0guoa"
+            crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.2/dist/face-landmarks-detection.min.js"
+            integrity="sha384-v+aXTWZ9mBDvMmT13iP31Ou/YNuRG4bS8/NZzsqGI14BdcK3+sUqEL02F4zUQyf+"
+            crossorigin="anonymous"></script>
+    <!-- three.js 3D 描画（うんこモデル用） -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+</head>
+<body>
+    <div id="loading">モデルとカメラを読み込み中...</div>
+    <div id="hint">🎩 顔より大きなうんこを頭に被せるよ！</div>
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+    <canvas id="poop-canvas" aria-hidden="true"></canvas>
+
+    <script>
+    'use strict';
+    // ═══════════════════════════════════════════
+    // DOM 参照
+    // ═══════════════════════════════════════════
+    const video      = document.getElementById('video');
+    const canvas     = document.getElementById('canvas');
+    const ctx        = canvas.getContext('2d');
+    const poopCanvas = document.getElementById('poop-canvas');
+    const loading    = document.getElementById('loading');
+    const hint       = document.getElementById('hint');
+
+    // ═══════════════════════════════════════════
+    // 調整パラメータ
+    // ═══════════════════════════════════════════
+    const POOP_HUES = [350, 43, 188, 317, 214, 262, 180, 31, 162, 18, 246, 332];
+    const MAX_HATS = 2;                // 帽子の最大数（＝検出顔数）
+    const HAT_WIDTH_FRAC = 1.45;       // 帽子の幅＝顔幅の 1.45 倍（うんこは顔より大きくする）
+    const HAT_SIZE_MIN = 60, HAT_SIZE_MAX = 260;   // 帽子の高さ(px) ＝ 顔幅 × HAT_WIDTH_FRAC（上限/下限）
+    const HAT_LIFT_FRAC = 0.35;        // 帽子の下面中心を額の上（ランドマーク10）から顔幅×この倍だけ上に置く
+    const HAT_TILT_BACK = .055;        // 下面平面の後ろへの寝かし角（rad ≒31°）：うんこを後方に倒して頭頂部の上に頂点を立てる
+    const YAW_GAIN = 2.2, YAW_MAX = 1.1;      // 左右の向き（rad）
+    const PITCH_GAIN = 2.5, PITCH_MAX = 0.9; // 上下の向き（rad）
+    const ROLL_GAIN = 0.9, ROLL_MAX = 0.6;   // 横ロール（rad）
+    const SMOOTHING = 0.75;            // 1 - 係数 越大 → 追従が遅い（EMA の底）
+    const MODEL_UNIT_HEIGHT = 100;     // テンプレート正規化後の高さ（モデル単位）
+
+    // face mesh ランドマーク
+    const K_FOREHEAD = 10,                // 額の真上（メッシュの最上部中央＝髪际）
+          K_NOSE = 1,                     // 鼻先
+          K_EYE_L = 33, K_EYE_R = 263,    // 目の外側
+          K_EAR_L = 234, K_EAR_R = 454,   // 耳（顔幅の基準）
+          K_CHIN = 152;                  // あご
+
+    // ═══════════════════════════════════════════
+    // アプリ状態
+    // ═══════════════════════════════════════════
+    let detector = null;                    // 顔ランドマーク検出器（遅延初期化）
+    let lastFrameTime = performance.now();
+    let hats = [];                          // 帽子（うんこ）オブジェクト
+    let debugFakeFace = null;               // #debug 用の偽顔（0-1 のビデオ座標）
+    let debugOverlayOn = false;
+
+    // 3D レンダラ関連
+    let poopRenderer = null, poopScene = null, poopCamera = null;
+    let poopTemplate = null;                // 中心原点・高さ100に正規化
+    let hatTemplate = null;                 // 下面中心を原点にオフセットした帽子用
+    let modelAspect = 1.4;                  // モデルの 幅/高さ 比（読み込み後を記録）
+
+    // カバーフィット計算（0/1/2/3.html と同じ）
+    function getCoverRect() {
+        const vw = video.videoWidth  || 640;
+        const vh = video.videoHeight || 480;
+        const va = vw / vh, ca = canvas.width / canvas.height;
+        let drawW, drawH, drawX, drawY;
+        if (va > ca) {
+            drawH = canvas.height; drawW = drawH * va;
+            drawX = (canvas.width - drawW) / 2; drawY = 0;
+        } else {
+            drawW = canvas.width; drawH = drawW / va;
+            drawX = 0; drawY = (canvas.height - drawH) / 2;
+        }
+        return { drawX, drawY, drawW, drawH,
+                 scaleX: drawW / vw, scaleY: drawH / vh };
+    }
+
+    function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+    // ═══════════════════════════════════════════
+    // 3D うんこレンダラ（index.html と同じ方式）
+    // ═══════════════════════════════════════════
+    function resizePoopRenderer() {
+        if (!poopRenderer) return;
+        const w = window.innerWidth, h = window.innerHeight;
+        poopRenderer.setSize(w, h, false);
+        poopCamera.left = -w / 2;
+        poopCamera.right = w / 2;
+        poopCamera.top = h / 2;
+        poopCamera.bottom = -h / 2;
+        poopCamera.updateProjectionMatrix();
+    }
+
+    async function setupPoopRenderer() {
+        poopRenderer = new THREE.WebGLRenderer({ canvas: poopCanvas, alpha: true, antialias: true });
+        poopRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        poopRenderer.setClearColor(0x000000, 0);
+        poopRenderer.outputEncoding = THREE.sRGBEncoding;
+        poopRenderer.shadowMap.enabled = true;
+        poopRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        poopScene = new THREE.Scene();
+        poopCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
+        poopCamera.position.z = 600;
+
+        poopScene.add(new THREE.HemisphereLight(0xfff4df, 0x24305c, 0.95));
+        const keyLight = new THREE.DirectionalLight(0xffe1b0, 2.0);
+        keyLight.position.set(-180, 260, 400);
+        keyLight.castShadow = true;
+        keyLight.shadow.mapSize.set(1024, 1024);
+        poopScene.add(keyLight);
+        const fillLight = new THREE.DirectionalLight(0x77c9ff, 0.82);
+        fillLight.position.set(260, 80, 260);
+        poopScene.add(fillLight);
+        const rimLight = new THREE.DirectionalLight(0xff68d2, 1.15);
+        rimLight.position.set(80, -260, 300);
+        poopScene.add(rimLight);
+
+        // うんこの影を受け止める透明プレーン
+        const shadowCatcher = new THREE.Mesh(
+            new THREE.PlaneGeometry(4000, 4000),
+            new THREE.ShadowMaterial({ color: 0x101020, opacity: 0.22 })
+        );
+        shadowCatcher.position.z = -45;
+        shadowCatcher.receiveShadow = true;
+        poopScene.add(shadowCatcher);
+        resizePoopRenderer();
+
+        // うんこモデルを読み込み（file:// では fetch がブロックされる）
+        const modelURL = new URL('object_poop.glb', document.baseURI).href;
+        let response;
+        try {
+            response = await fetch(modelURL);
+        } catch (error) {
+            throw new Error('object_poop.glb を読み込めませんでした。\nファイルを直接開いている（file://）場合、ブラウザはローカルファイルの fetch をブロックします。\n\nローカルサーバー経由でアクセスしてください。\n（例）python3 -m http.server 8080 を実行後、http://localhost:8080/4.html を開く');
+        }
+        if (!response.ok) {
+            throw new Error('object_poop.glb の読み込みに失敗しました（HTTP ' + response.status + '）。\nこのページと同じディレクトリに object_poop.glb があるか確認してください。');
+        }
+        const buffer = await response.arrayBuffer();
+        const gltf = await new Promise((resolve, reject) => {
+            new THREE.GLTFLoader().parse(buffer, '', resolve, reject);
+        });
+        poopTemplate = gltf.scene;
+
+        // 中心を原点にして高さ100に正規化（帽子の下面が local y=-50 に来る）
+        const bounds = new THREE.Box3().setFromObject(poopTemplate);
+        const modelHeight = Math.max(0.001, bounds.max.y - bounds.min.y);
+        poopTemplate.position.sub(bounds.getCenter(new THREE.Vector3()));
+        poopTemplate.scale.setScalar(100 / modelHeight);
+        poopTemplate.updateMatrixWorld(true);
+        poopTemplate.traverse(node => {
+            if (!node.isMesh) return;
+            node.geometry.computeVertexNormals();
+            node.geometry.normalizeNormals();
+        });
+        // 幅/高さ比を記録（帽子サイズの設計に使う）
+        const b2 = new THREE.Box3().setFromObject(poopTemplate);
+        modelAspect = Math.max(0.4, Math.min(2.5, (b2.max.x - b2.min.x) / (b2.max.y - b2.min.y)));
+
+        // 帽子用テンプレート：フラットな下面の中心をグループ原点に置く。
+        // 回転の軸が「帽子の底」になるので、頭を傾けると帽子もその場で揺れる。
+        hatTemplate = poopTemplate.clone(true);
+        hatTemplate.position.y += MODEL_UNIT_HEIGHT / 2;   // 下面 (y=-50) を y=0 に
+    }
+
+    /** 高さ size(px) のうんこ帽子（hue で着色、下面中心が原点）。 */
+    function makeHatVisual(size, hue) {
+        if (!hatTemplate) return null;
+        const visual = new THREE.Group();
+        const clone = hatTemplate.clone(true);
+        visual.add(clone);
+        const color = new THREE.Color().setHSL(hue / 360, 1.0, 0.3);
+        clone.traverse(node => {
+            if (!node.isMesh) return;
+            node.material = new THREE.MeshStandardMaterial({
+                color,
+                emissive: color.clone().multiplyScalar(0.16),
+                emissiveIntensity: 0.8,
+                roughness: 0.31,
+                metalness: 0.08,
+                transparent: true,
+                opacity: 1,
+                side: THREE.DoubleSide,
+            });
+            node.castShadow = true;
+        });
+        visual.scale.setScalar(size / 100);
+        poopScene.add(visual);
+        return visual;
+    }
+
+    function removeHatVisual(visual) {
+        if (visual) poopScene.remove(visual);
+    }
+
+    function setVisualOpacity(visual, opacity) {
+        visual.traverse(node => {
+            if (node.isMesh) node.material.opacity = opacity;
+        });
+    }
+
+    function renderPoops() {
+        if (poopRenderer) poopRenderer.render(poopScene, poopCamera);
+    }
+
+    // ═══════════════════════════════════════════
+    // カメラセットアップ（1/2.html と同じ）
+    // ═══════════════════════════════════════════
+    async function setupCamera() {
+        if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error('このブラウザはカメラAPIに対応していません。Chrome または Edge をお試しください。');
+        }
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                video: { width: 640, height: 480 }, audio: false,
+            });
+        } catch (e) {
+            if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+                throw new Error('カメラへのアクセスが拒否されています。\nブラウザのアドレスバー横にあるカメラアイコンをクリックして「許可」してください。\n\n※ ファイルを直接開いている場合は、ローカルサーバー経由で開く必要があります。');
+            } else if (e.name === 'NotFoundError') {
+                throw new Error('カメラが見つかりません。カメラが接続されているか確認してください。');
+            } else if (e instanceof TypeError) {
+                throw new Error('カメラの初期化に失敗しました（非セキュアな環境ではカメラが使えません）。\nhttp://localhost や https:// のURLから開いてください。');
+            } else {
+                throw new Error('カメラエラー: ' + e.name + ' - ' + e.message);
+            }
+        }
+        video.srcObject = stream;
+        return new Promise(resolve => { video.onloadedmetadata = () => resolve(video); });
+    }
+
+    // ═══════════════════════════════════════════
+    // 顔の読み取り（位置・向きの推定）
+    // ═══════════════════════════════════════════
+    /**
+     * face mesh キーポイントから帽子のアンカーと向きを出す。
+     * 帽子の下面（フラット面）は額の上（ランドマーク10＝髪际）を基準に
+     * HAT_LIFT_FRAC × 顔幅だけ上へ置き、うんこ本体は HAT_TILT_BACK だけ後ろに
+     * 寝かせることで、頂点が頭頂部の真上に立つようにする。
+     */
+    function readFaceInfo(keypoints, scaleX, scaleY, drawX, drawY) {
+        const need = [K_FOREHEAD, K_NOSE, K_EYE_L, K_EYE_R, K_EAR_L, K_EAR_R, K_CHIN];
+        for (const i of need) {
+            if (!keypoints[i]) return null;
+        }
+        const toCanvas = (i) => ({
+            x: keypoints[i].x * scaleX + drawX,
+            y: keypoints[i].y * scaleY + drawY,
+        });
+        const fore = toCanvas(K_FOREHEAD);
+        const nose = toCanvas(K_NOSE);
+        const eyeL = toCanvas(K_EYE_L);
+        const eyeR = toCanvas(K_EYE_R);
+        const earL = toCanvas(K_EAR_L);
+        const earR = toCanvas(K_EAR_R);
+
+        const faceW = Math.hypot(earR.x - earL.x, earR.y - earL.y);
+        if (faceW < 8) return null;   // 小さすぎて不確実
+
+        // アンカー：額の上（ランドマーク10＝髪际）から上に上げた点。
+        // 帽子の下面中心がここに置かれ、うんこは後ろに寝かされる（HAT_TILT_BACK）ので、
+        // 頂点が頭頂部の真上に位置する。
+        const anchorX = fore.x;
+        const anchorY = fore.y - HAT_LIFT_FRAC * faceW;
+
+        const eyeMidx = (eyeL.x + eyeR.x) / 2;
+        const eyeMidy = (eyeL.y + eyeR.y) / 2;
+        // 鼻先と目の中心のずれで頭が向いている方向を推定
+        const yaw   = clamp((nose.x - eyeMidx) / faceW * YAW_GAIN,   -YAW_MAX,   YAW_MAX);
+        const pitch = clamp((nose.y - eyeMidy) / faceW * PITCH_GAIN, -PITCH_MAX, PITCH_MAX);
+        const roll  = clamp(Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x) * ROLL_GAIN, -ROLL_MAX, ROLL_MAX);
+
+        return {
+            anchorX, anchorY, faceW,
+            hatSize: clamp(faceW * HAT_WIDTH_FRAC, HAT_SIZE_MIN, HAT_SIZE_MAX),
+            yaw, pitch, roll,
+        };
+    }
+
+    // #debug：偽の顔をキーポイントとして生成（fakeFace の 0-1 値をビデオピクセルに変換）。
+    // 本物の検出器（mediapipe ランタイム）は landmark.x * videoWidth のように
+    // ビデオのピクセル座標を返すため、readFaceInfo への引き渡しまで同じ単位にする。
+    function makeFakeFaceKeypoints() {
+        const f = debugFakeFace;
+        if (!f) return null;
+        const vw = video.videoWidth  || 640;
+        const vh = video.videoHeight || 480;
+        const px = (x, y) => ({ x: x * vw, y: y * vh });
+        const cx = f.x + f.w / 2;
+        const cy = f.y;
+        const k = {};
+        k[K_FOREHEAD] = px(cx, cy);
+        k[K_NOSE] = px(cx + f.yaw * f.w * 0.3, cy + f.w * 0.34 + f.pitch * f.w * 0.25);
+        k[K_EYE_L] = px(cx - f.w * 0.18 + f.roll * f.w * 0.1, cy + f.w * 0.16 - f.roll * f.w * 0.05);
+        k[K_EYE_R] = px(cx + f.w * 0.18 + f.roll * f.w * 0.1, cy + f.w * 0.16 + f.roll * f.w * 0.05);
+        k[K_EAR_L] = px(f.x, cy + f.w * 0.16);
+        k[K_EAR_R] = px(f.x + f.w, cy + f.w * 0.16);
+        k[K_CHIN] = px(cx, cy + f.w * 0.55);
+        return k;
+    }
+
+    // ═══════════════════════════════════════════
+    // 帽子オブジェクト
+    // ═══════════════════════════════════════════
+    function createHat(hue) {
+        const visual = makeHatVisual(HAT_SIZE_MIN, hue);
+        if (!visual) return null;
+        const hat = {
+            visual,
+            hue,
+            // 目標値（検出）と 現在値（スムーディング済み）
+            t: { x: 0, y: 0, size: HAT_SIZE_MIN, yaw: 0, pitch: 0, roll: 0, opacity: 0 },
+            c: { x: 0, y: 0, size: HAT_SIZE_MIN, yaw: 0, pitch: 0, roll: 0, opacity: 0 },
+            visible: false,
+            _faceIndex: null,
+            initX: null,
+        };
+        poopScene.add(visual);
+        hats.push(hat);
+        return hat;
+    }
+
+    function removeHat(hat) {
+        removeHatVisual(hat.visual);
+        const i = hats.indexOf(hat);
+        if (i >= 0) hats.splice(i, 1);
+    }
+
+    function updateHat(hat, info, step, now) {
+        hat.visible = true;
+        if (hat.initX === null) {
+            // 初回報告：現在の位置からフェードイン
+            hat.c.x = hat.t.x = info.anchorX;
+            hat.c.y = hat.t.y = info.anchorY;
+            hat.c.yaw = hat.t.yaw = info.yaw;
+            hat.c.pitch = hat.t.pitch = info.pitch;
+            hat.c.roll = hat.t.roll = info.roll;
+            hat.initX = now;
+        }
+        hat.t.x = info.anchorX;
+        hat.t.y = info.anchorY;
+        hat.t.size = info.hatSize;
+        hat.t.yaw = info.yaw;
+        hat.t.pitch = info.pitch;
+        hat.t.roll = info.roll;
+        hat.t.opacity = 1;
+
+        // ランダムウォーク風の EMA で検出ジッターを吸収
+        const s = 1 - Math.pow(SMOOTHING, step);
+        hat.c.x += (hat.t.x - hat.c.x) * s;
+        hat.c.y += (hat.t.y - hat.c.y) * s;
+        hat.c.size += (hat.t.size - hat.c.size) * s;
+        hat.c.yaw += (hat.t.yaw - hat.c.yaw) * s;
+        hat.c.pitch += (hat.t.pitch - hat.c.pitch) * s;
+        hat.c.roll += (hat.t.roll - hat.c.roll) * s;
+        // フェードイン（出現から約250ms）
+        const fadeIn = clamp((now - hat.initX) / 250, 0, 1);
+        hat.c.opacity = Math.min(hat.t.opacity, fadeIn);
+
+        applyHatTransform(hat);
+    }
+
+    // 検出が途切れたらフェードアウトして破棄
+    function fadeOutHat(hat, step) {
+        hat.visible = false;
+        hat.t.opacity = 0;
+        const s = 1 - Math.pow(SMOOTHING, step);
+        hat.c.opacity += (hat.t.opacity - hat.c.opacity) * s;
+        if (hat.c.opacity <= 0.02) {
+            removeHat(hat);
+            return;
+        }
+        applyHatTransform(hat);
+    }
+
+    function applyHatTransform(hat) {
+        const W = canvas.width, H = canvas.height;
+        const base = hat.c.size / 100;
+        // 下面中心（グループ原点）をアンカー上に置く → フラットな底が頭の裏面に一致する
+        hat.visual.position.set(
+            hat.c.x - W / 2,
+            H / 2 - hat.c.y,
+            0
+        );
+        // 検出ピッチに固定の後ろ傾き（HAT_TILT_BACK）を足す：
+        // 正面の顔に対してフラットな底を額の背面（後方）へ寝かせ、
+        // うんこの頂点が頭頂部の真上に立つ。
+        hat.visual.rotation.set(hat.c.pitch - HAT_TILT_BACK, hat.c.yaw, hat.c.roll);
+        hat.visual.scale.setScalar(base);
+        setVisualOpacity(hat.visual, Math.max(0, hat.c.opacity));
+    }
+
+    // ═══════════════════════════════════════════
+    // メインループ
+    // ═══════════════════════════════════════════
+    async function renderLoop() {
+        const now = performance.now();
+        const step = Math.min(3, Math.max(0.25, (now - lastFrameTime) / (1000 / 60)));
+        lastFrameTime = now;
+        const W = canvas.width, H = canvas.height;
+        const { drawX, drawY, drawW, drawH, scaleX, scaleY } = getCoverRect();
+
+        // カメラ映像（2D レイヤー）
+        ctx.clearRect(0, 0, W, H);
+        ctx.drawImage(video, drawX, drawY, drawW, drawH);
+
+        // 顔の検出（キーポイントはビデオピクセル単位。readFaceInfo がキャンバス座標へ変換）
+        const faceInfos = new Array(MAX_HATS).fill(null);
+        if (debugFakeFace) {
+            const k = makeFakeFaceKeypoints();
+            if (k) faceInfos[0] = readFaceInfo(k, scaleX, scaleY, drawX, drawY);
+        } else if (detector) {
+            try {
+                const faces = await detector.estimateFaces(video);
+                faces.forEach((face, i) => {
+                    if (i >= MAX_HATS) return;
+                    faceInfos[i] = readFaceInfo(face.keypoints, scaleX, scaleY, drawX, drawY);
+                });
+            } catch (_) { /* 検出エラーは無視してループ継続 */ }
+        }
+
+        // ── 帽子の管理 ──
+        // 1) 各帽子は、それまで追跡していた顔があれば追従する
+        for (const hat of hats) {
+            const info = (hat._faceIndex !== null) ? faceInfos[hat._faceIndex] : null;
+            if (info) {
+                info._taken = true;
+                updateHat(hat, info, step, now);
+            } else {
+                hat._faceIndex = null;      // バインド解除（2) で再割り当て）
+                fadeOutHat(hat, step);      // 顔が居なければフェードアウト
+            }
+        }
+        // 2) バインドを失った帽子を、今フレームで検出した空き顔に再割り当て
+        for (const hat of hats) {
+            if (hat._faceIndex !== null) continue;
+            const i = faceInfos.findIndex(f => f && !f._taken);
+            if (i >= 0) {
+                hat._faceIndex = i;
+                faceInfos[i]._taken = true;
+                updateHat(hat, faceInfos[i], step, now);
+            }
+        }
+        // 3) まだ帽子のない顔には新しい帽子を生成
+        for (let i = 0; i < MAX_HATS; i++) {
+            if (!faceInfos[i] || faceInfos[i]._taken) continue;
+            if (hats.length >= MAX_HATS) break;
+            faceInfos[i]._taken = true;
+            const hat = createHat(POOP_HUES[Math.floor(Math.random() * POOP_HUES.length)]);
+            if (hat) {
+                hat._faceIndex = i;
+                updateHat(hat, faceInfos[i], step, now);
+            }
+        }
+
+        // #debug 用オーバーレイ：アンカー位置と顔中心
+        if (debugOverlayOn) drawDebugOverlay();
+
+        // 3D レイヤーを描画
+        renderPoops();
+
+        requestAnimationFrame(renderLoop);
+    }
+
+    function drawDebugOverlay() {
+        ctx.strokeStyle = 'rgba(0,255,255,0.9)';
+        ctx.lineWidth = 2;
+        for (const hat of hats) {
+            if (hat.c.opacity <= 0.02) continue;
+            const x = hat.c.x, y = hat.c.y;
+            ctx.beginPath();
+            ctx.moveTo(x - 12, y); ctx.lineTo(x + 12, y);
+            ctx.moveTo(x, y - 12); ctx.lineTo(x, y + 12);
+            ctx.stroke();
+            // 帽子下面（平らな底）の直径を円で示す
+            ctx.beginPath();
+            ctx.arc(x, y, hat.c.size * modelAspect / 2, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // リサイズ
+    // ═══════════════════════════════════════════
+    function onResize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        resizePoopRenderer();
+    }
+
+    // ═══════════════════════════════════════════
+    // デバッグAPI（URLに #debug を付けて開いた時のみ公開）
+    // ═══════════════════════════════════════════
+    if (location.hash === '#debug') {
+        window.__debug = {
+            // 偽顔を走らせる： { x, y, w, yaw, pitch, roll }（0-1 のビデオ座標）
+            fakeFace: (o) => { debugFakeFace = o; debugOverlayOn = true; return !!o; },
+            fakeFaceOff: () => { debugFakeFace = null; debugOverlayOn = false; },
+            hats: () => hats.map(h => ({
+                visible: h.visible,
+                x: +h.c.x.toFixed(1),
+                y: +h.c.y.toFixed(1),
+                size: +h.c.size.toFixed(1),
+                yaw: +h.c.yaw.toFixed(3),
+                pitch: +h.c.pitch.toFixed(3),
+                roll: +h.c.roll.toFixed(3),
+                opacity: +h.c.opacity.toFixed(2),
+            })),
+        };
+    }
+
+    // ═══════════════════════════════════════════
+    // 初期化
+    // ═══════════════════════════════════════════
+    async function init() {
+        if (location.protocol === 'file:') {
+            loading.innerHTML = '&#x26A0;&#xFE0F; file:// で開いています。<br>このページは object_poop.glb を fetch で読み込むため、file:// では動作しません。<br>ローカルサーバー経由でアクセスしてください。<br><br>（例）<code>python3 -m http.server 8080</code> を実行後<br><a href="http://localhost:8080/4.html" style="color:#7af">http://localhost:8080/4.html</a> を開く';
+        }
+        try {
+            // 1. TF.js バックエンド（顔検出は mediapipe ランタイムを使うため、
+            //    失敗しても警告のみにして継続する）
+            if (typeof tf !== 'undefined') {
+                try {
+                    await tf.setBackend('webgl');
+                    await tf.ready();
+                } catch (e) {
+                    console.warn('TF.js WebGL バックエンドを初期化できませんでした（続行します）。', e);
+                }
+            }
+
+            // 2. カメラ（カメラへのアクセスを許可）
+            await setupCamera();
+            video.play();
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            window.addEventListener('resize', onResize);
+
+            // 3. 3D うんこレンダラとモデル
+            loading.textContent = '3Dうんこモデルを読み込み中...';
+            if (typeof THREE === 'undefined') {
+                throw new Error('three.js の読み込みに失敗しました。\nネットワーク接続を確認してページを再読み込みしてください。');
+            }
+            await setupPoopRenderer();
+
+            // 4. 顔の検出モデル（1.html と同じ face mesh）
+            loading.textContent = '顔の検出モデルを読み込み中...';
+            if (typeof faceLandmarksDetection === 'undefined') {
+                throw new Error('face-landmarks-detection ライブラリが読み込めませんでした。\nネットワーク接続を確認してページを再読み込みしてください。');
+            }
+            const model = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
+            detector = await faceLandmarksDetection.createDetector(model, {
+                runtime: 'mediapipe',
+                solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619',
+                refineLandmarks: false,
+                maxFaces: MAX_HATS,
+            });
+
+            loading.style.display = 'none';
+            hint.style.display = 'block';
+            setTimeout(() => {
+                hint.classList.add('fadeout');
+                hint.addEventListener('animationend', () => { hint.style.display = 'none'; }, { once: true });
+            }, 5000);
+            lastFrameTime = performance.now();
+            renderLoop();
+        } catch (err) {
+            loading.classList.add('error');
+            loading.textContent = '\u274C エラーが発生しました:\n\n' + err.message;
+            console.error(err);
+        }
+    }
+
+    init();
+    </script>
+</body>
+</html>

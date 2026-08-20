@@ -249,6 +249,14 @@
             <i class="icon fa-solid fa-poop" aria-hidden="true"></i>
             <span>Poops</span>
         </button>
+        <button class="nav-btn" data-effect="3">
+            <i class="icon fa-solid fa-cloud-rain" aria-hidden="true"></i>
+            <span>Rain</span>
+        </button>
+        <button class="nav-btn" data-effect="4">
+            <i class="icon fa-solid fa-hat-cowboy" aria-hidden="true"></i>
+            <span>Hat</span>
+        </button>
     </nav>
 
     <script>
@@ -282,6 +290,7 @@
     let animId        = null;
     let isSwitching   = false;
     let lastFrameTime = performance.now();
+    let effectIframe  = null;  // Full-screen iframe running 3.html / 4.html (effects 3 and 4)
     let uiHideTimer = null;
     let ballSizeScale = Number(ballSizeInput.value);
     let rainbowIntensity = Number(rainbowInput.value);
@@ -331,6 +340,8 @@
         0: { size: 2.0, minSize: 1.0, maxSize: 3.0, density: 0.2, minDensity: 0.05, maxDensity: 0.3 },
         1: { size: 1.5, minSize: 0.75, maxSize: 2.25, density: 0.2, minDensity: 0.05, maxDensity: 0.3 },
         2: { size: 2.0, minSize: 1.0, maxSize: 3.0, density: 0.25, minDensity: 0.05, maxDensity: 0.3 },
+        3: { size: 2.0, minSize: 1.0, maxSize: 3.0, density: 0.2, minDensity: 0.05, maxDensity: 0.3 },
+        4: { size: 2.0, minSize: 1.0, maxSize: 3.0, density: 0.2, minDensity: 0.05, maxDensity: 0.3 },
     };
 
     function setControlValue(input, value, min, max) {
@@ -936,6 +947,11 @@
                 case 0: await renderEffect0(step); break;
                 case 1: await renderEffect1(step); break;
                 case 2: await renderEffect2(step); break;
+                // Effects 3 and 4 are full-screen iframes (3.html / 4.html)
+                // which render themselves; keep the camera stream warm but
+                // skip all drawing.
+                case 3:
+                case 4: break;
             }
         } catch (_) { /* Ignore frame errors and continue. */ }
         animId = requestAnimationFrame(renderLoop);
@@ -954,6 +970,28 @@
         navBtns.forEach(btn => {
             btn.classList.toggle('active', Number(btn.dataset.effect) === n);
         });
+
+        // Effects 3 and 4 run 3.html / 4.html in a full-screen iframe.
+        // pointer-events:none lets taps pass through to this page so the
+        // edge-tap UI reveal keeps working; the pages need no input of their own.
+        if (n === 3 || n === 4) {
+            if (!effectIframe || effectIframe.dataset.effect !== String(n)) {
+                // Remove any previous iframe so its own camera stream is released.
+                if (effectIframe) effectIframe.remove();
+                effectIframe = document.createElement('iframe');
+                effectIframe.dataset.effect = String(n);
+                effectIframe.src = new URL(n === 3 ? '3.html' : '4.html', document.baseURI).href;
+                effectIframe.style.cssText =
+                    'position:fixed;inset:0;width:100vw;height:100vh;' +
+                    'border:0;background:#000;z-index:15;pointer-events:none;';
+                document.body.appendChild(effectIframe);
+            }
+            effectIframe.style.display = 'block';
+        } else if (effectIframe) {
+            // Destroy it so the page's own camera stream and render loop are released.
+            effectIframe.remove();
+            effectIframe = null;
+        }
 
         try {
             // Initialize detectors lazily.

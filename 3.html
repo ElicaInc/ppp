@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Poop Drop & Pop</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            overflow: hidden;
+            color: #fff;
+            font-family: sans-serif;
+        }
+        /* ビデオ要素は非表示にし、Canvasに描画します */
+        video { display: none; }
+        /* 鏡のように表示するため反転させます（2D/3Dの両キャンバスに適用） */
+        canvas {
+            transform: scaleX(-1);
+            position: fixed;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+        }
+        #loading {
+            position: absolute;
+            font-size: 24px;
+            font-weight: bold;
+            z-index: 10;
+            text-align: center;
+            padding: 20px;
+        }
+        #loading.error {
+            color: #ff6b6b;
+            font-size: 18px;
+            max-width: 80vw;
+            line-height: 1.6;
+            white-space: pre-line;
+        }
+        #hint {
+            display: none;
+            position: absolute;
+            bottom: 70px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 28px;
+            font-weight: bold;
+            color: #fff;
+            text-shadow: 0 0 12px rgba(255,180,255,0.9), 0 2px 8px rgba(0,0,0,0.8);
+            letter-spacing: 0.05em;
+            z-index: 10;
+            white-space: nowrap;
+            animation: hintPulse 2s ease-in-out infinite;
+        }
+        #hint.fadeout { animation: hintFade 1.5s ease forwards; }
+        @keyframes hintPulse {
+            0%, 100% { opacity: 1;   transform: translateX(-50%) scale(1); }
+            50%       { opacity: 0.6; transform: translateX(-50%) scale(1.05); }
+        }
+        @keyframes hintFade { from { opacity: 1; } to { opacity: 0; } }
+    </style>
+
+    <!-- TensorFlow.js と関連ライブラリ -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.22.0/dist/tf-core.min.js"
+            integrity="sha384-ZVckeGw84RpbmPMzx1s9LFUqIaeIsG46rmlH/HynDuJikkmGLnTDnEmT0CrKI6Yi"
+            crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.22.0/dist/tf-backend-webgl.min.js"
+            integrity="sha384-PAbE0QuTSZkDuS/hX4MEx1MZ0Nwd+mkb2Znz35ZqGDjb36klpR8/mCpykhdd7uHW"
+            crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"
+            integrity="sha384-oHwoZ9HyKv5ark5VOH+XWdbNfmhYtptAOBuV8plz6mAfXvTA6d8fULuYllWouEK2"
+            crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/hand-pose-detection@2.0.1/dist/hand-pose-detection.min.js"
+            integrity="sha384-i6CbDrUnvLVXa+pIMpkX0yLzM4eQzlhugNq6jFntYXTGMnhk+JcchzouxFLI/xQX"
+            crossorigin="anonymous"></script>
+    <!-- matter.js 物理エンジン -->
+    <script src="https://cdn.jsdelivr.net/npm/matter-js@0.19.0/build/matter.min.js"
+            integrity="sha384-OqQP3UcU7efkEYDRjGmQou2uEvzGFGRtwdYXTjnupeB9cWogSgQ4BOhyklFBYbBR"
+            crossorigin="anonymous"></script>
+    <!-- three.js 3D 描画（うんこモデル用） -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+</head>
+<body>
+    <div id="loading">モデルとカメラを読み込み中...</div>
+    <div id="hint">👆 落ちるうんこを指先で弾けてね！</div>
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+    <canvas id="poop-canvas" aria-hidden="true"></canvas>
+
+    <script>
+    'use strict';
+    const { Engine, World, Bodies, Body } = Matter;
+
+    // ═══════════════════════════════════════════
+    // DOM 参照
+    // ═══════════════════════════════════════════
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('canvas');
+    const ctx      = canvas.getContext('2d');
+    const poopCanvas = document.getElementById('poop-canvas');
+    const loading  = document.getElementById('loading');
+    const hint     = document.getElementById('hint');
+
+    // ═══════════════════════════════════════════
+    // 調整パラメータ
+    // ═══════════════════════════════════════════
+    const FINGERTIP_RADIUS = 18;            // 指先の当たり判定半径（px）
+    const POOP_HUES = [350, 43, 188, 317, 214, 262, 180, 31, 162, 18, 246, 332];
+    const GRAVITY_FALL = 0.16;              // 緩やかな落下の重力
+    const POOP_SIZE_MIN = 92, POOP_SIZE_MAX = 180; // うんこの表示高さ（px）
+    const MAX_FALLING  = 22;                // うんこの上限（落下中＋床に積まれたもの）
+    const MAX_SPLASH   = 200;               // 飛沫の総数の上限
+
+    // ═══════════════════════════════════════════
+    // アプリ状態
+    // ═══════════════════════════════════════════
+    let detector = null;                    // 手の検出器（遅延初期化）
+    let engine = null, world = null;
+    let wallBodies = [];
+    let lastFrameTime = performance.now();
+    let spawnTimer = 0, nextSpawnIn = 500;  // スポーン間隔（ms）
+
+    // うんこオブジェクト:
+    //   body   - matter.js の物理ボディ（円。落下中・床で積まれた後も形状を保つ）
+    //   visual - three.js の 3D 表示（テンプレートのクローン）
+    //   state  - 'falling'（落下中・床で積まれた状態を含む） | 'popping'
+    let poops = [];
+    let splashes = [];                      // 飛沫（3D クアッド + 2D 風物理）
+    let rings    = [];                      // 弾け瞬間のリングフラッシュ
+
+    // 3D レンダラ関連
+    let poopRenderer = null, poopScene = null, poopCamera = null;
+    let poopTemplate = null;
+    let splashGeo = null, ringGeo = null, splashTex = null;
+
+    // カバーフィット計算（0/1/2.html と同じ）
+    function getCoverRect() {
+        const vw = video.videoWidth  || 640;
+        const vh = video.videoHeight || 480;
+        const va = vw / vh, ca = canvas.width / canvas.height;
+        let drawW, drawH, drawX, drawY;
+        if (va > ca) {
+            drawH = canvas.height; drawW = drawH * va;
+            drawX = (canvas.width - drawW) / 2; drawY = 0;
+        } else {
+            drawW = canvas.width; drawH = drawW / va;
+            drawX = 0; drawY = (canvas.height - drawH) / 2;
+        }
+        return { drawX, drawY, drawW, drawH,
+                 scaleX: drawW / vw, scaleY: drawH / vh };
+    }
+
+    // ═══════════════════════════════════════════
+    // 3D うんこレンダラ（index.html と同じ方式）
+    // ═══════════════════════════════════════════
+    function resizePoopRenderer() {
+        if (!poopRenderer) return;
+        const w = window.innerWidth, h = window.innerHeight;
+        poopRenderer.setSize(w, h, false);
+        poopCamera.left = -w / 2;
+        poopCamera.right = w / 2;
+        poopCamera.top = h / 2;
+        poopCamera.bottom = -h / 2;
+        poopCamera.updateProjectionMatrix();
+    }
+
+    async function setupPoopRenderer() {
+        poopRenderer = new THREE.WebGLRenderer({ canvas: poopCanvas, alpha: true, antialias: true });
+        poopRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        poopRenderer.setClearColor(0x000000, 0);
+        poopRenderer.outputEncoding = THREE.sRGBEncoding;
+        poopRenderer.shadowMap.enabled = true;
+        poopRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        poopScene = new THREE.Scene();
+        poopCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
+        poopCamera.position.z = 600;
+
+        poopScene.add(new THREE.HemisphereLight(0xfff4df, 0x24305c, 0.95));
+        const keyLight = new THREE.DirectionalLight(0xffe1b0, 2.0);
+        keyLight.position.set(-180, 260, 400);
+        keyLight.castShadow = true;
+        keyLight.shadow.mapSize.set(1024, 1024);
+        poopScene.add(keyLight);
+        const fillLight = new THREE.DirectionalLight(0x77c9ff, 0.82);
+        fillLight.position.set(260, 80, 260);
+        poopScene.add(fillLight);
+        const rimLight = new THREE.DirectionalLight(0xff68d2, 1.15);
+        rimLight.position.set(80, -260, 300);
+        poopScene.add(rimLight);
+
+        // うんこの影を受け止める透明プレーン
+        const shadowCatcher = new THREE.Mesh(
+            new THREE.PlaneGeometry(4000, 4000),
+            new THREE.ShadowMaterial({ color: 0x101020, opacity: 0.22 })
+        );
+        shadowCatcher.position.z = -45;
+        shadowCatcher.receiveShadow = true;
+        poopScene.add(shadowCatcher);
+
+        // 飛沫・リングで使う共用ジオメトリ
+        splashGeo = new THREE.PlaneGeometry(1, 1);
+        ringGeo = new THREE.RingGeometry(0.86, 1, 40);
+
+        // 飛沫のテクスチャ：ラジアルグラデーションの柔らかい円（外部アセット不要）
+        const texCanvas = document.createElement('canvas');
+        texCanvas.width = texCanvas.height = 64;
+        const texCtx = texCanvas.getContext('2d');
+        const grad = texCtx.createRadialGradient(32, 32, 0, 32, 32, 32);
+        grad.addColorStop(0, 'rgba(255,255,255,1)');
+        grad.addColorStop(0.55, 'rgba(255,255,255,0.9)');
+        grad.addColorStop(1, 'rgba(255,255,255,0)');
+        texCtx.fillStyle = grad;
+        texCtx.fillRect(0, 0, 64, 64);
+        splashTex = new THREE.CanvasTexture(texCanvas);
+        resizePoopRenderer();
+
+        // うんこモデルを読み込み（file:// では fetch がブロックされる）
+        const modelURL = new URL('object_poop.glb', document.baseURI).href;
+        let response;
+        try {
+            response = await fetch(modelURL);
+        } catch (error) {
+            throw new Error('object_poop.glb を読み込めませんでした。\nファイルを直接開いている（file://）場合、ブラウザはローカルファイルの fetch をブロックします。\n\nローカルサーバー経由でアクセスしてください。\n（例）python3 -m http.server 8080 を実行後、http://localhost:8080/3.html を開く');
+        }
+        if (!response.ok) {
+            throw new Error('object_poop.glb の読み込みに失敗しました（HTTP ' + response.status + '）。\nこのページと同じディレクトリに object_poop.glb があるか確認してください。');
+        }
+        const buffer = await response.arrayBuffer();
+        const gltf = await new Promise((resolve, reject) => {
+            new THREE.GLTFLoader().parse(buffer, '', resolve, reject);
+        });
+        poopTemplate = gltf.scene;
+
+        // 全クローンが約100pxの高さに正規化されるよう、中心を原点に移動してスケールする
+        const bounds = new THREE.Box3().setFromObject(poopTemplate);
+        const modelHeight = Math.max(0.001, bounds.max.y - bounds.min.y);
+        poopTemplate.position.sub(bounds.getCenter(new THREE.Vector3()));
+        poopTemplate.scale.setScalar(100 / modelHeight);
+        poopTemplate.updateMatrixWorld(true);
+        poopTemplate.traverse(node => {
+            if (!node.isMesh) return;
+            node.geometry.computeVertexNormals();
+            node.geometry.normalizeNormals();
+        });
+    }
+
+    /** 高さ size(px) のうんこ（hue で着色）をシーンに追加して返す。 */
+    function makePoopVisual(size, hue) {
+        if (!poopTemplate) return null;
+        const visual = new THREE.Group();
+        visual.add(poopTemplate.clone(true));
+        const color = new THREE.Color().setHSL(hue / 360, 1.0, 0.3);
+        visual.traverse(node => {
+            if (!node.isMesh) return;
+            node.material = new THREE.MeshStandardMaterial({
+                color,
+                emissive: color.clone().multiplyScalar(0.16),
+                emissiveIntensity: 0.8,
+                roughness: 0.31,
+                metalness: 0.08,
+                transparent: true,
+                opacity: 1,
+                side: THREE.DoubleSide,
+            });
+            node.castShadow = true;
+        });
+        visual.scale.setScalar(size / 100);
+        poopScene.add(visual);
+        return visual;
+    }
+
+    function removePoopVisual(visual) {
+        if (visual) poopScene.remove(visual);
+    }
+
+    function setVisualOpacity(visual, opacity) {
+        visual.traverse(node => {
+            if (node.isMesh) node.material.opacity = opacity;
+        });
+    }
+
+    function renderPoops() {
+        if (poopRenderer) poopRenderer.render(poopScene, poopCamera);
+    }
+
+    // ═══════════════════════════════════════════
+    // カメラセットアップ（2.html と同じ）
+    // ═══════════════════════════════════════════
+    async function setupCamera() {
+        if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error('このブラウザはカメラAPIに対応していません。Chrome または Edge をお試しください。');
+        }
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                video: { width: 640, height: 480 }, audio: false,
+            });
+        } catch (e) {
+            if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+                throw new Error('カメラへのアクセスが拒否されています。\nブラウザのアドレスバー横にあるカメラアイコンをクリックして「許可」してください。\n\n※ ファイルを直接開いている場合は、ローカルサーバー経由で開く必要があります。');
+            } else if (e.name === 'NotFoundError') {
+                throw new Error('カメラが見つかりません。カメラが接続されているか確認してください。');
+            } else if (e instanceof TypeError) {
+                throw new Error('カメラの初期化に失敗しました（非セキュアな環境ではカメラが使えません）。\nhttp://localhost や https:// のURLから開いてください。');
+            } else {
+                throw new Error('カメラエラー: ' + e.name + ' - ' + e.message);
+            }
+        }
+        video.srcObject = stream;
+        return new Promise(resolve => { video.onloadedmetadata = () => resolve(video); });
+    }
+
+    // ═══════════════════════════════════════════
+    // 物理ワールド（matter.js）
+    // ═══════════════════════════════════════════
+    function createWalls() {
+        const W = canvas.width, H = canvas.height, T = 80;
+        // 天井は用意しない：うんこは画面の上端より上からスポーンして落下してくるため、
+        // 天井コライダーがあるとスポーン位置と重なって天井に吸着してしまう。
+        // うんこは上には飛び出さないため、床＋左右壁だけで十分。
+        wallBodies = [
+            Bodies.rectangle(W/2,   H+T/2,  W+T*2, T, { isStatic: true, restitution: 0.05, friction: 0.6,  label: 'floor' }),
+            Bodies.rectangle(-T/2,   H/2,   T, H+T*2, { isStatic: true, restitution: 0.3,  friction: 0.3,  label: 'wall' }),
+            Bodies.rectangle(W+T/2,  H/2,   T, H+T*2, { isStatic: true, restitution: 0.3,  friction: 0.3,  label: 'wall' }),
+        ];
+        World.add(world, wallBodies);
+    }
+
+    function setupPhysics() {
+        engine = Engine.create();
+        world  = engine.world;
+        engine.gravity.y = GRAVITY_FALL;   // 遅くゆっくり落ちる
+        createWalls();
+        // 床や他のうんこに到達した後も潰れず、重力のまま積もっていく。
+        // 物理ボディ（円）より 3D 形状が横幅で広いので、積もった表示は
+        // 自然に重なり合うように見える。
+    }
+
+    // リサイズ時に壁を再構築
+    function rebuildWalls() {
+        World.remove(world, wallBodies);
+        createWalls();
+    }
+
+    // ═══════════════════════════════════════════
+    // うんこの生成・ぺちゃんこ化・弾け
+    // ═══════════════════════════════════════════
+    function spawnPoop(x) {
+        const W = canvas.width;
+        const size = POOP_SIZE_MIN + Math.random() * (POOP_SIZE_MAX - POOP_SIZE_MIN);
+        const r = size / 2;
+        const px = x !== undefined ? x
+            : r * 1.2 + Math.random() * Math.max(1, W - r * 2.4);
+        const hue = POOP_HUES[Math.floor(Math.random() * POOP_HUES.length)];
+        const body = Bodies.circle(px, -r - 40, r, {
+            restitution: 0.12,
+            friction: 0.3,
+            frictionAir: 0.012,      // 终端速度を緩やかに
+            density: 0.0015,
+            label: 'poop',
+            collisionFilter: { category: 0x0001, mask: 0x0001 },
+        });
+        Body.setVelocity(body, { x: (Math.random() - 0.5) * 1.2, y: 0.5 });
+        Body.setAngularVelocity(body, (Math.random() - 0.5) * 0.02);
+
+        const visual = makePoopVisual(size, hue);
+        if (!visual) { World.remove(world, body); return null; }
+
+        const p = {
+            body, visual, size, hue,
+            state: 'falling',
+            rotX: (Math.random() - 0.5) * 0.8,   // 初期の立体回転（rad）
+            rotY: (Math.random() - 0.5) * 0.8,
+            spinX: (Math.random() - 0.5) * 0.5,  // 緩やかな回転速度（rad/s）
+            spinY: (Math.random() - 0.5) * 0.5,
+            x: px, y: body.position.y,            // 弾けた直後の表示位置
+        };
+        body._poop = p;
+        World.add(world, body);
+        poops.push(p);
+        return p;
+    }
+
+    /** 指先で触れたうんこを「パンっ」と弾く */
+    function burstPoop(p, now) {
+        if (!p || p.state !== 'falling') return;
+        p.state = 'popping';
+        p.popStart = now;
+        p.x = p.body.position.x;
+        p.y = p.body.position.y;
+        World.remove(world, p.body);
+        p.body = null;
+        spawnSplashes(p.x, p.y, p.hue);
+        spawnPopRing(p.x, p.y, p.hue, p.size);
+    }
+
+    // ── 飛沫（うんこと同じ色の液体粒子） ──
+    function spawnSplashes(x, y, hue) {
+        if (!splashGeo) return;
+        const c = new THREE.Color().setHSL(hue / 360, 1.0, 0.45);
+        const n = 14 + Math.floor(Math.random() * 6);
+        for (let i = 0; i < n; i++) {
+            const ang = Math.random() * Math.PI * 2;
+            const drip = Math.random() < 0.35;   // 一部はゆっくり垂れる「しずく」
+            const speed = drip ? 1 + Math.random() * 2 : 4 + Math.random() * 8;
+            const mat = new THREE.MeshBasicMaterial({
+                color: c.clone(),
+                map: splashTex,
+                transparent: true,
+                opacity: 1,
+                side: THREE.DoubleSide,
+                depthWrite: false,
+            });
+            const mesh = new THREE.Mesh(splashGeo, mat);
+            const s = {
+                mesh,
+                x: x + (Math.random() - 0.5) * 12,
+                y: y + (Math.random() - 0.5) * 12,
+                vx: Math.cos(ang) * speed,
+                vy: Math.sin(ang) * speed - (drip ? 0 : 1.5),  // 上方向にわずかに弾く
+                life: 0,
+                maxLife: drip ? 110 + Math.random() * 50 : 60 + Math.random() * 50,
+                size: drip ? 9 + Math.random() * 10 : 6 + Math.random() * 10,
+                z: 8 + Math.random() * 30,
+            };
+            mesh.position.set(s.x - canvas.width / 2, canvas.height / 2 - s.y, s.z);
+            mesh.scale.setScalar(s.size);
+            poopScene.add(mesh);
+            splashes.push(s);
+        }
+        // 総数を上限内で保つ（古い方から削除）
+        while (splashes.length > MAX_SPLASH) {
+            const s = splashes.shift();
+            poopScene.remove(s.mesh);
+            s.mesh.material.dispose();
+        }
+    }
+
+    function updateSplashes(step) {
+        const W = canvas.width, H = canvas.height;
+        for (let i = splashes.length - 1; i >= 0; i--) {
+            const s = splashes[i];
+            s.life += step;
+            if (s.life >= s.maxLife || s.y > H + 60) {
+                poopScene.remove(s.mesh);
+                s.mesh.material.dispose();
+                splashes.splice(i, 1);
+                continue;
+            }
+            s.vy += 0.5 * step;                            // 重力で下に垂れていく
+            s.vx *= Math.pow(0.985, step);
+            s.x += s.vx * step;
+            s.y += s.vy * step;
+            s.mesh.position.set(s.x - W / 2, H / 2 - s.y, s.z);
+            const q = s.life / s.maxLife;
+            s.mesh.material.opacity = Math.max(0, Math.pow(1 - q, 1.3));
+            s.mesh.scale.setScalar(s.size * (1 + q * 0.6));  // 滲みながら消える
+        }
+    }
+
+    // ── 弾け瞬間のリングフラッシュ ──
+    function spawnPopRing(x, y, hue, size) {
+        if (!ringGeo) return;
+        const mat = new THREE.MeshBasicMaterial({
+            color: new THREE.Color().setHSL(hue / 360, 1.0, 0.6),
+            transparent: true,
+            opacity: 0.95,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+        });
+        const mesh = new THREE.Mesh(ringGeo, mat);
+        const r = { mesh, life: 0, maxLife: 16, size: size * 0.55 };
+        mesh.position.set(x - canvas.width / 2, canvas.height / 2 - y, 44);
+        mesh.scale.setScalar(r.size);
+        poopScene.add(mesh);
+        rings.push(r);
+    }
+
+    function updateRings(step) {
+        for (let i = rings.length - 1; i >= 0; i--) {
+            const r = rings[i];
+            r.life += step;
+            const t = r.life / r.maxLife;
+            if (t >= 1) {
+                poopScene.remove(r.mesh);
+                r.mesh.material.dispose();
+                rings.splice(i, 1);
+                continue;
+            }
+            r.mesh.scale.setScalar(r.size * (1 + t * 1.8));
+            r.mesh.material.opacity = 0.95 * (1 - t);
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // 手の検出
+    // ═══════════════════════════════════════════
+    // 指先5点（親指〜小指の先端）をキャンバス座標に変換
+    function getFingertips(keypoints, scaleX, scaleY, drawX, drawY) {
+        return [4, 8, 12, 16, 20].map(i => {
+            const kp = keypoints[i];
+            if (!kp) return null;
+            return { x: kp.x * scaleX + drawX, y: kp.y * scaleY + drawY };
+        });
+    }
+
+    // ═══════════════════════════════════════════
+    // メインループ
+    // ═══════════════════════════════════════════
+    async function renderLoop() {
+        const now = performance.now();
+        const step = Math.min(3, Math.max(0.25, (now - lastFrameTime) / (1000 / 60)));
+        lastFrameTime = now;
+        const W = canvas.width, H = canvas.height;
+        const { drawX, drawY, drawW, drawH, scaleX, scaleY } = getCoverRect();
+
+        // カメラ映像（2D レイヤー）
+        ctx.clearRect(0, 0, W, H);
+        ctx.drawImage(video, drawX, drawY, drawW, drawH);
+
+        // 手の検出（最大2手 × 指先5点）
+        const tips = new Array(10).fill(null);
+        if (detector) {
+            try {
+                const hands = await detector.estimateHands(video);
+                hands.forEach((hand, hi) => {
+                    if (hi >= 2) return;
+                    getFingertips(hand.keypoints, scaleX, scaleY, drawX, drawY)
+                        .forEach((tip, fi) => { tips[hi * 5 + fi] = tip; });
+                });
+            } catch (_) { /* 検出エラーは無視してループ継続 */ }
+        }
+
+        // 1) 上からゆっくりうんこが落ちてくる（一定間隔でスポーン）
+        spawnTimer += step * (1000 / 60);
+        if (spawnTimer >= nextSpawnIn) {
+            spawnTimer = 0;
+            nextSpawnIn = 900 + Math.random() * 1000;
+            if (poops.filter(p => p.state === 'falling').length < MAX_FALLING) spawnPoop();
+        }
+
+        // 2) 指先で触れたうんこを弾く
+        for (const tip of tips) {
+            if (!tip) continue;
+            for (const p of poops) {
+                if (p.state !== 'falling') continue;
+                const d = Math.hypot(tip.x - p.body.position.x, tip.y - p.body.position.y);
+                if (d < p.size * 0.5 + FINGERTIP_RADIUS) burstPoop(p, now);
+            }
+        }
+
+        // 3) 物理演算を1フレーム分進める
+        try {
+            Engine.update(engine, (1000 / 60) * step);
+        } catch (_) { /* 物理エラーはフレームをまたいで無視 */ }
+
+        // 4) うんこの表示を更新
+        for (let i = poops.length - 1; i >= 0; i--) {
+            const p = poops[i];
+            const base = p.size / 100;
+
+            if (p.state === 'popping') {
+                // 「パンっ」：すこし膨らみながら短時間で消える
+                const t = Math.min(1, (now - p.popStart) / 130);
+                p.visual.position.set(p.x - W / 2, H / 2 - p.y, 0);
+                p.visual.scale.setScalar(base * (1 + t * 0.4));
+                setVisualOpacity(p.visual, 1 - t);
+                if (t >= 1) {
+                    removePoopVisual(p.visual);
+                    poops.splice(i, 1);
+                }
+                continue;
+            }
+
+            if (!p.body) continue;   // 弾けた直後など、物理ボディのない状態
+            const bx = p.body.position.x;
+            const by = p.body.position.y;
+            p.visual.position.set(bx - W / 2, H / 2 - by, 0);
+
+            // 落下中も床で積もった後も 3D 形状を保ち、重力のまま積もっていく
+            // （指先で弾いて初めて消える）
+            // 動いている間だけゆっくり立体回転し、静止するとその姿勢で止まる
+            if (Math.hypot(p.body.velocity.x, p.body.velocity.y) > 0.15) {
+                const dt = step * (1000 / 60) / 1000;   // 秒換算
+                p.rotX += p.spinX * dt;
+                p.rotY += p.spinY * dt;
+            }
+            p.visual.rotation.set(p.rotX, p.rotY, p.body.angle);
+            p.visual.scale.setScalar(base);
+            setVisualOpacity(p.visual, 1);
+        }
+
+        // 5) 飛沫とリングを更新し、3D レイヤーを描画
+        updateSplashes(step);
+        updateRings(step);
+        renderPoops();
+
+        requestAnimationFrame(renderLoop);
+    }
+
+    // ═══════════════════════════════════════════
+    // リサイズ
+    // ═══════════════════════════════════════════
+    function onResize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        resizePoopRenderer();
+        if (world) rebuildWalls();
+    }
+
+    // ═══════════════════════════════════════════
+    // デバッグAPI（URLに #debug を付けて開いた時のみ公開）
+    // ═══════════════════════════════════════════
+    if (location.hash === '#debug') {
+        window.__debug = {
+            poops: () => poops.map(p => ({
+                state: p.state,
+                x: p.body ? p.body.position.x : p.x,
+                y: p.body ? p.body.position.y : p.y,
+                size: p.size,
+            })),
+            spawnPoop,
+            burstAt: (x, y) => {
+                let n = 0;
+                for (const p of poops) {
+                    if (p.state !== 'falling' || !p.body) continue;
+                    if (Math.hypot(x - p.body.position.x, y - p.body.position.y) < p.size * 0.5 + FINGERTIP_RADIUS) {
+                        burstPoop(p, performance.now());
+                        n++;
+                    }
+                }
+                return n;
+            },
+            rots: () => poops.map(p => ({
+                state: p.state,
+                rotX: +p.rotX.toFixed(3),
+                rotY: +p.rotY.toFixed(3),
+                angle: +(p.body ? p.body.angle : 0).toFixed(3),
+                speed: p.body ? +Math.hypot(p.body.velocity.x, p.body.velocity.y).toFixed(3) : 0,
+            })),
+            splashes: () => splashes.length,
+            rings: () => rings.length,
+        };
+    }
+
+    // ═══════════════════════════════════════════
+    // 初期化
+    // ═══════════════════════════════════════════
+    async function init() {
+        if (location.protocol === 'file:') {
+            loading.innerHTML = '&#x26A0;&#xFE0F; file:// で開いています。<br>このページは object_poop.glb を fetch で読み込むため、file:// では動作しません。<br>ローカルサーバー経由でアクセスしてください。<br><br>（例）<code>python3 -m http.server 8080</code> を実行後<br><a href="http://localhost:8080/3.html" style="color:#7af">http://localhost:8080/3.html</a> を開く';
+        }
+        try {
+            // 1. TF.js バックエンド（手検出は mediapipe ランタイムを使うため、
+            //    失敗しても警告のみにして継続する）
+            if (typeof tf !== 'undefined') {
+                try {
+                    await tf.setBackend('webgl');
+                    await tf.ready();
+                } catch (e) {
+                    console.warn('TF.js WebGL バックエンドを初期化できませんでした（続行します）。', e);
+                }
+            }
+
+            // 2. カメラ（カメラへのアクセスを許可）
+            await setupCamera();
+            video.play();
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            window.addEventListener('resize', onResize);
+
+            // 3. 3D うんこレンダラとモデル
+            loading.textContent = '3Dうんこモデルを読み込み中...';
+            if (typeof THREE === 'undefined') {
+                throw new Error('three.js の読み込みに失敗しました。\nネットワーク接続を確認してページを再読み込みしてください。');
+            }
+            await setupPoopRenderer();
+
+            // 4. 手の検出モデル
+            loading.textContent = '手の検出モデルを読み込み中...';
+            if (typeof handPoseDetection === 'undefined') {
+                throw new Error('hand-pose-detection ライブラリが読み込めませんでした。\nネットワーク接続を確認してページを再読み込みしてください。');
+            }
+            const model = handPoseDetection.SupportedModels.MediaPipeHands;
+            detector = await handPoseDetection.createDetector(model, {
+                runtime: 'mediapipe',
+                solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240',
+                modelType: 'full',
+                maxHands: 2,
+            });
+
+            // 5. 物理ワールド
+            setupPhysics();
+
+            loading.style.display = 'none';
+            hint.style.display = 'block';
+            setTimeout(() => hint.classList.add('fadeout'), 4000);
+            lastFrameTime = performance.now();
+            renderLoop();
+        } catch (err) {
+            loading.classList.add('error');
+            loading.textContent = '\u274C エラーが発生しました:\n\n' + err.message;
+            console.error(err);
+        }
+    }
+
+    init();
+    </script>
+</body>
+</html>
