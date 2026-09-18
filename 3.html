@@ -90,7 +90,7 @@
 
     <script>
     'use strict';
-    const { Engine, World, Bodies, Body } = Matter;
+    const { Engine, World, Bodies, Body, Events } = Matter;
 
     // ═══════════════════════════════════════════
     // DOM 参照
@@ -111,20 +111,27 @@
     const POOP_SIZE_MIN = 92, POOP_SIZE_MAX = 180; // うんこの表示高さ（px）
     const MAX_FALLING  = 22;                // うんこの上限（落下中＋床に積まれたもの）
     const MAX_SPLASH   = 200;               // 飛沫の総数の上限
+    const SOFT_SAMPLES = 25;               // 横断面の独立した接地点
+    const softProfile = new Float32Array(SOFT_SAMPLES);
+    const PHYSICS_DT = 1000 / 120;          // 固定刻みで柔らかさをフレームレートから独立させる
 
     // ═══════════════════════════════════════════
     // アプリ状態
     // ═══════════════════════════════════════════
     let detector = null;                    // 手の検出器（遅延初期化）
+    let detectedHands = [], detectingHands = false, lastHandDetection = 0;
     let engine = null, world = null;
     let wallBodies = [];
     let lastFrameTime = performance.now();
     let spawnTimer = 0, nextSpawnIn = 500;  // スポーン間隔（ms）
+    let physicsAccumulator = 0;
+    let simulationTime = 0;
+    const pendingImpacts = new Map();
 
     // うんこオブジェクト:
-    //   body   - matter.js の物理ボディ（円。落下中・床で積まれた後も形状を保つ）
+    //   body   - 落下中は円、着地後は接地点ごとに形を変える複合コライダー
     //   visual - three.js の 3D 表示（テンプレートのクローン）
-    //   state  - 'falling'（落下中・床で積まれた状態を含む） | 'popping'
+    //   state  - 'falling' | 'squashed' | 'popping'
     let poops = [];
     let splashes = [];                      // 飛沫（3D クアッド + 2D 風物理）
     let rings    = [];                      // 弾け瞬間のリングフラッシュ
@@ -132,6 +139,7 @@
     // 3D レンダラ関連
     let poopRenderer = null, poopScene = null, poopCamera = null;
     let poopTemplate = null;
+    let modelAspect = 1;
     let splashGeo = null, ringGeo = null, splashTex = null;
 
     // カバーフィット計算（0/1/2.html と同じ）
@@ -170,23 +178,25 @@
         poopRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
         poopRenderer.setClearColor(0x000000, 0);
         poopRenderer.outputEncoding = THREE.sRGBEncoding;
+        poopRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+        poopRenderer.toneMappingExposure = 1.08;
         poopRenderer.shadowMap.enabled = true;
         poopRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
         poopScene = new THREE.Scene();
         poopCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
         poopCamera.position.z = 600;
 
-        poopScene.add(new THREE.HemisphereLight(0xfff4df, 0x24305c, 0.95));
-        const keyLight = new THREE.DirectionalLight(0xffe1b0, 2.0);
+        poopScene.add(new THREE.HemisphereLight(0xfff7ef, 0x6476aa, 0.72));
+        const keyLight = new THREE.DirectionalLight(0xfff1df, 1.65);
         keyLight.position.set(-180, 260, 400);
         keyLight.castShadow = true;
         keyLight.shadow.mapSize.set(1024, 1024);
         poopScene.add(keyLight);
-        const fillLight = new THREE.DirectionalLight(0x77c9ff, 0.82);
+        const fillLight = new THREE.DirectionalLight(0xaadfff, 0.5);
         fillLight.position.set(260, 80, 260);
         poopScene.add(fillLight);
-        const rimLight = new THREE.DirectionalLight(0xff68d2, 1.15);
-        rimLight.position.set(80, -260, 300);
+        const rimLight = new THREE.DirectionalLight(0xffb6e7, 0.95);
+        rimLight.position.set(180, 180, -160);
         poopScene.add(rimLight);
 
         // うんこの影を受け止める透明プレーン
@@ -235,14 +245,49 @@
         // 全クローンが約100pxの高さに正規化されるよう、中心を原点に移動してスケールする
         const bounds = new THREE.Box3().setFromObject(poopTemplate);
         const modelHeight = Math.max(0.001, bounds.max.y - bounds.min.y);
-        poopTemplate.position.sub(bounds.getCenter(new THREE.Vector3()));
         poopTemplate.scale.setScalar(100 / modelHeight);
+        poopTemplate.updateMatrixWorld(true);
+        poopTemplate.position.sub(new THREE.Box3().setFromObject(poopTemplate).getCenter(new THREE.Vector3()));
         poopTemplate.updateMatrixWorld(true);
         poopTemplate.traverse(node => {
             if (!node.isMesh) return;
             node.geometry.computeVertexNormals();
             node.geometry.normalizeNormals();
         });
+        const normalizedBounds = new THREE.Box3().setFromObject(poopTemplate);
+        modelAspect = (normalizedBounds.max.x - normalizedBounds.min.x) / 100;
+        const bakedTemplate = new THREE.Group();
+        poopTemplate.traverse(node => {
+            if (!node.isMesh) return;
+            const geometry = node.geometry.clone().applyMatrix4(node.matrixWorld);
+            const mesh = new THREE.Mesh(geometry, node.material);
+            // Source coordinates live on shared geometry; mesh.userData is serialized on clone.
+            geometry.userData.sourcePositions = Array.from(geometry.attributes.position.array);
+            const positions = geometry.attributes.position;
+            const indices = geometry.index;
+            // 実メッシュの三角形と各断面の交点を使う。近傍頂点の最大値では
+            // 斜面を高く見積もり、積層間に隙間を作ってしまう。
+            const count = indices ? indices.count : positions.count;
+            for (let i = 0; i < count; i += 3) {
+                for (let edge = 0; edge < 3; edge++) {
+                    const a = indices ? indices.getX(i + edge) : i + edge;
+                    const b = indices ? indices.getX(i + (edge + 1) % 3) : i + (edge + 1) % 3;
+                    const x0 = positions.getX(a), x1 = positions.getX(b);
+                    if (Math.abs(x1 - x0) < 1e-8) continue;
+                    const start = Math.max(0, Math.ceil((Math.min(x0, x1) / (modelAspect * 100) + 0.5) * (SOFT_SAMPLES - 1)));
+                    const end = Math.min(SOFT_SAMPLES - 1, Math.floor((Math.max(x0, x1) / (modelAspect * 100) + 0.5) * (SOFT_SAMPLES - 1)));
+                    for (let bin = start; bin <= end; bin++) {
+                        const x = (bin / (SOFT_SAMPLES - 1) - 0.5) * modelAspect * 100;
+                        const t = (x - x0) / (x1 - x0);
+                        const y = positions.getY(a) * (1 - t) + positions.getY(b) * t;
+                        softProfile[bin] = Math.max(softProfile[bin], (y + 50) / 100);
+                    }
+                }
+            }
+            bakedTemplate.add(mesh);
+        });
+        for (let i = 0; i < SOFT_SAMPLES; i++) softProfile[i] = Math.max(0.035, softProfile[i]);
+        poopTemplate = bakedTemplate;
     }
 
     /** 高さ size(px) のうんこ（hue で着色）をシーンに追加して返す。 */
@@ -250,15 +295,18 @@
         if (!poopTemplate) return null;
         const visual = new THREE.Group();
         visual.add(poopTemplate.clone(true));
-        const color = new THREE.Color().setHSL(hue / 360, 1.0, 0.3);
+        const color = new THREE.Color().setHSL(hue / 360, 0.82, 0.52);
         visual.traverse(node => {
             if (!node.isMesh) return;
-            node.material = new THREE.MeshStandardMaterial({
+            node.userData.sourcePositions = node.geometry.userData.sourcePositions;
+            node.material = new THREE.MeshPhysicalMaterial({
                 color,
-                emissive: color.clone().multiplyScalar(0.16),
-                emissiveIntensity: 0.8,
-                roughness: 0.31,
-                metalness: 0.08,
+                emissive: color.clone().multiplyScalar(0.035),
+                emissiveIntensity: 0.35,
+                roughness: 0.34,
+                metalness: 0,
+                clearcoat: 0.5,
+                clearcoatRoughness: 0.24,
                 transparent: true,
                 opacity: 1,
                 side: THREE.DoubleSide,
@@ -271,7 +319,13 @@
     }
 
     function removePoopVisual(visual) {
-        if (visual) poopScene.remove(visual);
+        if (!visual) return;
+        poopScene.remove(visual);
+        visual.traverse(node => {
+            if (!node.isMesh) return;
+            node.material.dispose();
+            if (node.userData.deformed) node.geometry.dispose();
+        });
     }
 
     function setVisualOpacity(visual, opacity) {
@@ -332,9 +386,208 @@
         world  = engine.world;
         engine.gravity.y = GRAVITY_FALL;   // 遅くゆっくり落ちる
         createWalls();
-        // 床や他のうんこに到達した後も潰れず、重力のまま積もっていく。
-        // 物理ボディ（円）より 3D 形状が横幅で広いので、積もった表示は
-        // 自然に重なり合うように見える。
+        Events.on(engine, 'collisionStart', event => {
+            for (const { bodyA, bodyB } of event.pairs) {
+                for (const [body, support] of [[bodyA, bodyB], [bodyB, bodyA]]) {
+                    const p = body._poop;
+                    if (!p || p.state !== 'falling') continue;
+                    const onFloor = support.label === 'floor';
+                    const onPoop = support._poop?.state === 'squashed' && support.bounds.min.y > body.position.y;
+                    if (!onFloor && !onPoop) continue;
+                    // 衝突解決で速度が失われる前の相対速度から変形量を決める。
+                    const speed = Math.max(0, p.impactVy - (support._poop?.impactVy || 0));
+                    if (p.state === 'falling' || speed > 1.5) {
+                        pendingImpacts.set(p, Math.max(pendingImpacts.get(p) || 0, speed));
+                    }
+                }
+            }
+        });
+    }
+
+    function squashPoop(p, speed) {
+        if (!p.body || p.state === 'popping') return;
+        const energy = Math.min(1, speed * speed / 100);
+        if (p.state === 'falling') {
+            const body = p.body;
+            const bottom = Math.min(canvas.height, body.bounds.max.y);
+            p.mass = body.mass;
+            p.centerX = body.position.x;
+            p.state = 'squashed';
+            p.landedAt = simulationTime;
+            p.width = p.size * modelAspect;
+            // 各接地点が独立して沈み、隣との粘りでつながる。硬い板は残さない。
+            p.columns = Array.from({ length: SOFT_SAMPLES }, () => ({
+                bottom, velocity: 0, compression: 1, load: 0, nextLoad: 0,
+            }));
+            World.remove(world, body);
+            const parts = p.columns.slice(1).map(() => {
+                const part = Bodies.rectangle(p.centerX, bottom, 1, 1, {
+                    isStatic: true, friction: 0.9, restitution: 0, label: 'soft-poop',
+                });
+                part._poop = p;
+                return part;
+            });
+            p.body = Body.create({ parts, isStatic: true, label: 'soft-poop' });
+            p.body._poop = p;
+            World.add(world, p.body);
+            p.visual.traverse(node => {
+                if (!node.isMesh) return;
+                node.geometry = node.geometry.clone();
+                node.geometry.attributes.position.setUsage(THREE.DynamicDrawUsage);
+                node.userData.deformed = true;
+            });
+            syncSoftCollider(p);
+        }
+        p.restSquash = Math.min(p.restSquash, 0.38 - energy * 0.16);
+        p.squashVelocity -= Math.min(9, speed * 60 / p.size * 0.8);
+    }
+
+    function sampleSoftSurface(p, x) {
+        const u = (x - p.centerX) / p.width + 0.5;
+        if (u < 0 || u > 1) return null;
+        const f = u * (SOFT_SAMPLES - 1);
+        const i = Math.min(SOFT_SAMPLES - 2, Math.floor(f));
+        const t = f - i;
+        const a = p.columns[i], b = p.columns[i + 1];
+        const topA = a.bottom - p.size * p.squash * softProfile[i] * a.compression;
+        const topB = b.bottom - p.size * p.squash * softProfile[i + 1] * b.compression;
+        return { y: topA * (1 - t) + topB * t, index: i, mix: t };
+    }
+
+    function updateSoftBody(p, dt, supports) {
+        p.squashVelocity += (240 * (p.restSquash - p.squash) - 19 * p.squashVelocity) * dt;
+        p.squash = Math.max(0.14, Math.min(1, p.squash + p.squashVelocity * dt));
+        if (p.squash === 0.14 && p.squashVelocity < 0) p.squashVelocity = 0;
+        p.spread = Math.min(1 / Math.sqrt(p.squash), canvas.width * 0.94 / (p.size * modelAspect));
+        p.width = p.size * modelAspect * p.spread;
+        p.centerX = Math.max(p.width / 2, Math.min(canvas.width - p.width / 2, p.centerX));
+        const previousBottoms = p.columns.map(c => c.bottom);
+        const columnMass = p.mass / SOFT_SAMPLES;
+        const spacing = p.width / (SOFT_SAMPLES - 1);
+        const cohesion = 4500 / (spacing * spacing);
+        for (let i = 0; i < SOFT_SAMPLES; i++) {
+            const c = p.columns[i];
+            // 局所的に載る重さで厚みを減らす。下層へ荷重も伝える。
+            const targetCompression = Math.max(0.52, 1 / (1 + c.load / columnMass * 0.12));
+            c.compression += (targetCompression - c.compression) * (1 - Math.exp(-8 * dt));
+            const left = previousBottoms[Math.max(0, i - 1)];
+            const right = previousBottoms[Math.min(SOFT_SAMPLES - 1, i + 1)];
+            const gravity = engine.gravity.y * engine.gravity.scale * 1e6;
+            c.velocity += (gravity + cohesion * (left + right - 2 * c.bottom)) * dt;
+            c.velocity *= Math.exp(-2.5 * dt);
+            c.bottom += c.velocity * dt;
+            const x = p.centerX + (i / (SOFT_SAMPLES - 1) - 0.5) * p.width;
+            let surfaceY = canvas.height, support = null, sample = null;
+            for (const below of supports) {
+                const hit = sampleSoftSurface(below, x);
+                if (hit && hit.y < surfaceY) {
+                    surfaceY = hit.y; support = below; sample = hit;
+                }
+            }
+            // 接触点ごとに非貫通制約を解く。支えのない端には重力が残る。
+            const touching = c.bottom >= surfaceY ||
+                (support && c.contact === support && surfaceY - c.bottom < 6);
+            if (touching) {
+                c.bottom = surfaceY;
+                c.velocity = Math.min(0, c.velocity) * 0.1;
+                c.contact = support;
+                if (support) {
+                    const weight = columnMass + c.load;
+                    support.columns[sample.index].nextLoad += weight * (1 - sample.mix);
+                    support.columns[sample.index + 1].nextLoad += weight * sample.mix;
+                }
+            } else {
+                c.contact = null;
+            }
+        }
+        syncSoftCollider(p);
+    }
+
+    function syncSoftCollider(p) {
+        const snapshot = [p.centerX, p.width, p.squash, ...p.columns.flatMap(c => [c.bottom, c.compression])];
+        if (p.colliderSnapshot && snapshot.every((value, i) =>
+            Math.abs(value - p.colliderSnapshot[i]) < (i === 2 || (i >= 3 && i % 2 === 0) ? 0.0001 : 0.01))) return;
+        p.colliderSnapshot = snapshot;
+        // 分割した表面と同じ傾斜を持つ台形で、次に落ちる物体を受け止める。
+        const parts = p.body.parts;
+        const min = { x: Infinity, y: Infinity }, max = { x: -Infinity, y: -Infinity };
+        for (let i = 0; i < SOFT_SAMPLES - 1; i++) {
+            const x0 = p.centerX + (i / (SOFT_SAMPLES - 1) - 0.5) * p.width;
+            const x1 = x0 + p.width / (SOFT_SAMPLES - 1);
+            const a = p.columns[i], b = p.columns[i + 1];
+            const y0 = a.bottom - p.size * p.squash * softProfile[i] * a.compression;
+            const y1 = b.bottom - p.size * p.squash * softProfile[i + 1] * b.compression;
+            const part = parts[i + 1];
+            // Body.setVertices は重心を既存位置へ移すため、後で本来の重心へ戻す。
+            const vertices = [{ x: x0, y: y0 }, { x: x1, y: y1 },
+                { x: x1, y: b.bottom }, { x: x0, y: a.bottom }];
+            const centre = Matter.Vertices.centre(vertices);
+            Body.setVertices(part, vertices);
+            Body.setPosition(part, centre);
+            min.x = Math.min(min.x, part.bounds.min.x); min.y = Math.min(min.y, part.bounds.min.y);
+            max.x = Math.max(max.x, part.bounds.max.x); max.y = Math.max(max.y, part.bounds.max.y);
+        }
+        // Matter は複合ボディの各部品で衝突を解く。親の広域判定も更新する。
+        Object.assign(p.body.bounds.min, min); Object.assign(p.body.bounds.max, max);
+        p.body.position.x = p.centerX;
+        p.body.position.y = (min.y + max.y) / 2;
+        p.body.positionPrev.x = p.body.position.x;
+        p.body.positionPrev.y = p.body.position.y;
+    }
+
+    function deformSoftVisual(p) {
+        const anchorY = p.body.position.y;
+        const snapshot = [p.squash, p.spread, ...p.columns.flatMap(c => [c.bottom, c.compression])];
+        const changed = !p.meshSnapshot || snapshot.some((value, i) =>
+            Math.abs(value - p.meshSnapshot[i]) > (i >= 2 && i % 2 === 0 ? 0.025 : 0.0001));
+        if (changed) p.meshAnchorY = anchorY;
+        p.visual.position.set(p.centerX - canvas.width / 2, canvas.height / 2 - p.meshAnchorY, 0);
+        p.visual.rotation.set(0, 0, 0);
+        p.visual.scale.setScalar(1);
+        if (!changed) return;
+        p.meshSnapshot = snapshot;
+        // 局所的な圧縮で減った体積は奥行きへ逃がす。
+        const compression = p.columns.reduce((sum, c) => sum + c.compression, 0) / SOFT_SAMPLES;
+        const depth = (p.size / 100) / (p.squash * p.spread * compression);
+        p.visual.traverse(node => {
+            if (!node.isMesh) return;
+            const source = node.userData.sourcePositions;
+            const position = node.geometry.attributes.position;
+            for (let v = 0; v < position.count; v++) {
+                const x = source[v * 3], y = source[v * 3 + 1], z = source[v * 3 + 2];
+                const f = Math.max(0, Math.min(SOFT_SAMPLES - 1, (x / (modelAspect * 100) + 0.5) * (SOFT_SAMPLES - 1)));
+                const i = Math.min(SOFT_SAMPLES - 2, Math.floor(f)), t = f - i;
+                const a = p.columns[i], b = p.columns[i + 1];
+                const bottom = a.bottom * (1 - t) + b.bottom * t;
+                const thickness = a.compression * (1 - t) + b.compression * t;
+                position.setXYZ(v, x * p.size / 100 * p.spread,
+                    anchorY - bottom + (y + 50) * p.size / 100 * p.squash * thickness, z * depth);
+            }
+            position.needsUpdate = true;
+            node.geometry.computeVertexNormals();
+            node.geometry.computeBoundingBox();
+            node.geometry.computeBoundingSphere();
+        });
+    }
+
+    function advancePhysics(elapsedMs) {
+        physicsAccumulator += elapsedMs;
+        while (physicsAccumulator >= PHYSICS_DT) {
+            simulationTime += PHYSICS_DT;
+            const supports = [];
+            const soft = poops.filter(p => p.state === 'squashed').sort((a, b) => a.landedAt - b.landedAt);
+            for (const p of poops) if (p.body) p.impactVy = p.body.velocity.y;
+            for (const p of soft) p.columns.forEach(c => { c.nextLoad = 0; });
+            for (const p of soft) {
+                updateSoftBody(p, PHYSICS_DT / 1000, supports);
+                supports.push(p);
+            }
+            for (const p of soft) p.columns.forEach(c => { c.load = c.nextLoad; });
+            Engine.update(engine, PHYSICS_DT);
+            for (const [p, speed] of pendingImpacts) squashPoop(p, speed);
+            pendingImpacts.clear();
+            physicsAccumulator -= PHYSICS_DT;
+        }
     }
 
     // リサイズ時に壁を再構築
@@ -370,6 +623,7 @@
         const p = {
             body, visual, size, hue,
             state: 'falling',
+            squash: 1, restSquash: 1, squashVelocity: 0, spread: 1, impactVy: 0,
             rotX: (Math.random() - 0.5) * 0.8,   // 初期の立体回転（rad）
             rotY: (Math.random() - 0.5) * 0.8,
             spinX: (Math.random() - 0.5) * 0.5,  // 緩やかな回転速度（rad/s）
@@ -384,11 +638,12 @@
 
     /** 指先で触れたうんこを「パンっ」と弾く */
     function burstPoop(p, now) {
-        if (!p || p.state !== 'falling') return;
+        if (!p || p.state === 'popping' || !p.body) return;
+        p.popScale = p.visual.scale.clone();
         p.state = 'popping';
         p.popStart = now;
-        p.x = p.body.position.x;
-        p.y = p.body.position.y;
+        p.x = p.visual.position.x + canvas.width / 2;
+        p.y = canvas.height / 2 - p.visual.position.y;
         World.remove(world, p.body);
         p.body = null;
         spawnSplashes(p.x, p.y, p.hue);
@@ -508,7 +763,7 @@
     // ═══════════════════════════════════════════
     // メインループ
     // ═══════════════════════════════════════════
-    async function renderLoop() {
+    function renderLoop() {
         const now = performance.now();
         const step = Math.min(3, Math.max(0.25, (now - lastFrameTime) / (1000 / 60)));
         lastFrameTime = now;
@@ -521,39 +776,40 @@
 
         // 手の検出（最大2手 × 指先5点）
         const tips = new Array(10).fill(null);
-        if (detector) {
-            try {
-                const hands = await detector.estimateHands(video);
-                hands.forEach((hand, hi) => {
-                    if (hi >= 2) return;
-                    getFingertips(hand.keypoints, scaleX, scaleY, drawX, drawY)
-                        .forEach((tip, fi) => { tips[hi * 5 + fi] = tip; });
-                });
-            } catch (_) { /* 検出エラーは無視してループ継続 */ }
+        // 手の推論を待たずに描画し、着地の短い変形も滑らかに見せる。
+        if (detector && !detectingHands && now - lastHandDetection > 50) {
+            detectingHands = true;
+            lastHandDetection = now;
+            detector.estimateHands(video)
+                .then(hands => { detectedHands = hands; })
+                .catch(() => { detectedHands = []; })
+                .finally(() => { detectingHands = false; });
         }
+        if (now - lastHandDetection < 250) detectedHands.forEach((hand, hi) => {
+            if (hi >= 2) return;
+            getFingertips(hand.keypoints, scaleX, scaleY, drawX, drawY)
+                .forEach((tip, fi) => { tips[hi * 5 + fi] = tip; });
+        });
 
         // 1) 上からゆっくりうんこが落ちてくる（一定間隔でスポーン）
         spawnTimer += step * (1000 / 60);
         if (spawnTimer >= nextSpawnIn) {
             spawnTimer = 0;
             nextSpawnIn = 900 + Math.random() * 1000;
-            if (poops.filter(p => p.state === 'falling').length < MAX_FALLING) spawnPoop();
+            if (poops.filter(p => p.body).length < MAX_FALLING) spawnPoop();
         }
 
         // 2) 指先で触れたうんこを弾く
         for (const tip of tips) {
             if (!tip) continue;
             for (const p of poops) {
-                if (p.state !== 'falling') continue;
-                const d = Math.hypot(tip.x - p.body.position.x, tip.y - p.body.position.y);
-                if (d < p.size * 0.5 + FINGERTIP_RADIUS) burstPoop(p, now);
+                if (!p.body) continue;
+                if (touchesPoop(p, tip.x, tip.y)) burstPoop(p, now);
             }
         }
 
         // 3) 物理演算を1フレーム分進める
-        try {
-            Engine.update(engine, (1000 / 60) * step);
-        } catch (_) { /* 物理エラーはフレームをまたいで無視 */ }
+        advancePhysics((1000 / 60) * step);
 
         // 4) うんこの表示を更新
         for (let i = poops.length - 1; i >= 0; i--) {
@@ -564,7 +820,7 @@
                 // 「パンっ」：すこし膨らみながら短時間で消える
                 const t = Math.min(1, (now - p.popStart) / 130);
                 p.visual.position.set(p.x - W / 2, H / 2 - p.y, 0);
-                p.visual.scale.setScalar(base * (1 + t * 0.4));
+                p.visual.scale.copy(p.popScale).multiplyScalar(1 + t * 0.4);
                 setVisualOpacity(p.visual, 1 - t);
                 if (t >= 1) {
                     removePoopVisual(p.visual);
@@ -578,16 +834,21 @@
             const by = p.body.position.y;
             p.visual.position.set(bx - W / 2, H / 2 - by, 0);
 
-            // 落下中も床で積もった後も 3D 形状を保ち、重力のまま積もっていく
-            // （指先で弾いて初めて消える）
-            // 動いている間だけゆっくり立体回転し、静止するとその姿勢で止まる
+            if (p.state === 'squashed') {
+                deformSoftVisual(p);
+                setVisualOpacity(p.visual, 1);
+                continue;
+            }
+
+            // 落下中はゆっくり回転し、速度に応じてほんの少し縦に伸びる。
             if (Math.hypot(p.body.velocity.x, p.body.velocity.y) > 0.15) {
                 const dt = step * (1000 / 60) / 1000;   // 秒換算
                 p.rotX += p.spinX * dt;
                 p.rotY += p.spinY * dt;
             }
             p.visual.rotation.set(p.rotX, p.rotY, p.body.angle);
-            p.visual.scale.setScalar(base);
+            const stretch = 1 + Math.min(0.12, Math.max(0, p.body.velocity.y) * 0.009);
+            p.visual.scale.set(base / Math.sqrt(stretch), base * stretch, base / Math.sqrt(stretch));
             setVisualOpacity(p.visual, 1);
         }
 
@@ -603,10 +864,37 @@
     // リサイズ
     // ═══════════════════════════════════════════
     function onResize() {
+        const oldW = canvas.width, oldH = canvas.height;
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
         resizePoopRenderer();
-        if (world) rebuildWalls();
+        if (world) {
+            rebuildWalls();
+            for (const p of poops) {
+                if (!p.body) continue;
+                if (p.state === 'squashed') {
+                    p.centerX *= canvas.width / oldW;
+                    p.columns.forEach(c => { c.bottom += canvas.height - oldH; });
+                    continue;
+                }
+                const halfW = (p.body.bounds.max.x - p.body.bounds.min.x) / 2;
+                const halfH = (p.body.bounds.max.y - p.body.bounds.min.y) / 2;
+                Body.setPosition(p.body, {
+                    x: Math.max(Math.min(halfW, canvas.width / 2), Math.min(canvas.width - halfW, p.body.position.x * canvas.width / oldW)),
+                    y: Math.min(canvas.height - halfH, p.body.position.y + (p.state === 'squashed' ? canvas.height - oldH : 0)),
+                });
+            }
+        }
+    }
+
+    function touchesPoop(p, x, y) {
+        if (p.state === 'squashed') {
+            const sample = sampleSoftSurface(p, x);
+            if (!sample) return false;
+            const a = p.columns[sample.index], b = p.columns[sample.index + 1];
+            return y >= sample.y - FINGERTIP_RADIUS && y <= a.bottom * (1 - sample.mix) + b.bottom * sample.mix + FINGERTIP_RADIUS;
+        }
+        return Math.hypot(x - p.body.position.x, y - p.body.position.y) < p.size * 0.5 + FINGERTIP_RADIUS;
     }
 
     // ═══════════════════════════════════════════
@@ -619,13 +907,14 @@
                 x: p.body ? p.body.position.x : p.x,
                 y: p.body ? p.body.position.y : p.y,
                 size: p.size,
+                squash: p.squash,
             })),
             spawnPoop,
             burstAt: (x, y) => {
                 let n = 0;
                 for (const p of poops) {
-                    if (p.state !== 'falling' || !p.body) continue;
-                    if (Math.hypot(x - p.body.position.x, y - p.body.position.y) < p.size * 0.5 + FINGERTIP_RADIUS) {
+                    if (!p.body) continue;
+                    if (touchesPoop(p, x, y)) {
                         burstPoop(p, performance.now());
                         n++;
                     }
