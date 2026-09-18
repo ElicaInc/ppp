@@ -979,6 +979,9 @@
         // pointer-events:none lets taps pass through to this page so the
         // edge-tap UI reveal keeps working; the pages need no input of their own.
         if (n === 3 || n === 4) {
+            // Rain / Hat own the full-screen surface. Keep the parent controls
+            // out of the iframe so the effect is not covered by index.html UI.
+            hideInteractiveUI();
             if (!effectIframe || effectIframe.dataset.effect !== String(n)) {
                 // Remove any previous iframe so its own camera stream is released.
                 if (effectIframe) effectIframe.remove();
@@ -995,6 +998,7 @@
             // Destroy it so the page's own camera stream and render loop are released.
             effectIframe.remove();
             effectIframe = null;
+            showInteractiveUI();
         }
 
         try {
