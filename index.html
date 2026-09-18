@@ -430,22 +430,24 @@
         poopRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
         poopRenderer.setClearColor(0x000000, 0);
         poopRenderer.outputEncoding = THREE.sRGBEncoding;
+        poopRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+        poopRenderer.toneMappingExposure = 1.08;
         poopRenderer.shadowMap.enabled = true;
         poopRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
         poopScene = new THREE.Scene();
         poopCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
         poopCamera.position.z = 600;
-        poopScene.add(new THREE.HemisphereLight(0xfff4df, 0x24305c, 0.95));
-        const keyLight = new THREE.DirectionalLight(0xffe1b0, 2.0);
+        poopScene.add(new THREE.HemisphereLight(0xfff7ef, 0x6476aa, 0.72));
+        const keyLight = new THREE.DirectionalLight(0xfff1df, 1.65);
         keyLight.position.set(-180, 260, 400);
         keyLight.castShadow = true;
         keyLight.shadow.mapSize.set(1024, 1024);
         poopScene.add(keyLight);
-        const fillLight = new THREE.DirectionalLight(0x77c9ff, 0.82);
+        const fillLight = new THREE.DirectionalLight(0xaadfff, 0.5);
         fillLight.position.set(260, 80, 260);
         poopScene.add(fillLight);
-        const rimLight = new THREE.DirectionalLight(0xff68d2, 1.15);
-        rimLight.position.set(80, -260, 300);
+        const rimLight = new THREE.DirectionalLight(0xffb6e7, 0.95);
+        rimLight.position.set(180, 180, -160);
         poopScene.add(rimLight);
 
         const shadowCatcher = new THREE.Mesh(
@@ -475,8 +477,9 @@
         const bounds = new THREE.Box3().setFromObject(poopTemplate);
         const modelHeight = Math.max(0.001, bounds.max.y - bounds.min.y);
         // Normalize every clone to a roughly 100 px-tall object before its particle scale is applied.
-        poopTemplate.position.sub(bounds.getCenter(new THREE.Vector3()));
         poopTemplate.scale.setScalar(100 / modelHeight);
+        poopTemplate.updateMatrixWorld(true);
+        poopTemplate.position.sub(new THREE.Box3().setFromObject(poopTemplate).getCenter(new THREE.Vector3()));
         poopTemplate.updateMatrixWorld(true);
         poopTemplate.traverse(node => {
             if (!node.isMesh) return;
@@ -489,19 +492,20 @@
         if (!poopTemplate) return null;
         const visual = new THREE.Group();
         visual.add(poopTemplate.clone(true));
-        // High-chroma, slightly deep base tones keep the objects vivid and
-        // illustration-like even when a face is turned away from the key light.
-        const color = new THREE.Color().setHSL(hue / 360, 1.0, 0.3);
+        // Candy colors and broad, non-metallic highlights keep the rounded form readable.
+        const color = new THREE.Color().setHSL(hue / 360, 0.82, 0.52);
         visual.traverse(node => {
             if (!node.isMesh) return;
             // Normals are generated once while loading the template, allowing this
             // material to produce smooth, rounded light and shade on every clone.
-            node.material = new THREE.MeshStandardMaterial({
+            node.material = new THREE.MeshPhysicalMaterial({
                 color,
-                emissive: color.clone().multiplyScalar(0.16),
-                emissiveIntensity: 0.8,
-                roughness: 0.31,
-                metalness: 0.08,
+                emissive: color.clone().multiplyScalar(0.035),
+                emissiveIntensity: 0.35,
+                roughness: 0.34,
+                metalness: 0,
+                clearcoat: 0.5,
+                clearcoatRoughness: 0.24,
                 transparent: true,
                 side: THREE.DoubleSide,
             });
